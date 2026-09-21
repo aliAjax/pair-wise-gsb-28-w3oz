@@ -1,182 +1,136 @@
-import { FormEvent, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import {
+  DndContext,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import { App as AntApp } from "antd";
+import { orderStatusOf } from "./domain/rules";
+import { useScheduleStore } from "./store/scheduleStore";
+import { OrderForm } from "./components/OrderForm";
+import { DriverForm } from "./components/DriverForm";
+import { OrderPool } from "./components/OrderPool";
+import { DriverLane } from "./components/DriverLane";
+import { ConflictPanel } from "./components/ConflictPanel";
+import { VersionPanel } from "./components/VersionPanel";
+import { ReasonModal } from "./components/ReasonModal";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: string[];
-};
-
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
-
-const project = {
-  "number": 14,
-  "folder": "hxwl/frontend/hxwlfront-14",
-  "framework": "react",
-  "title": "配送任务拖拽排班",
-  "subtitle": "把待分配订单安排给司机，并统计任务数和总重量。",
-  "industry": "物流",
-  "stack": [
-    "React",
-    "Vite",
-    "TypeScript",
-    "Ant Design",
-    "dnd-kit"
-  ],
-  "storageKey": "hxwlfront-14-schedule",
-  "formTitle": "新增待分配订单",
-  "primaryAction": "加入待分配",
-  "entityLabel": "订单",
-  "statuses": [
-    "待分配",
-    "已分配",
-    "已完成"
-  ],
-  "filters": [
-    "全部司机",
-    "刘师傅",
-    "赵师傅",
-    "孙师傅"
-  ],
-  "fields": [
-    {
-      "key": "orderNo",
-      "label": "订单号"
-    },
-    {
-      "key": "driver",
-      "label": "司机",
-      "type": "select",
-      "options": [
-        "刘师傅",
-        "赵师傅",
-        "孙师傅"
-      ]
-    },
-    {
-      "key": "weight",
-      "label": "重量kg",
-      "type": "number"
-    },
-    {
-      "key": "destination",
-      "label": "目的地"
-    }
-  ],
-  "records": [
-    {
-      "orderNo": "ORD-9012",
-      "driver": "刘师傅",
-      "weight": 260,
-      "destination": "浦东",
-      "status": "已分配",
-      "notes": "上午配送"
-    },
-    {
-      "orderNo": "ORD-9031",
-      "driver": "赵师傅",
-      "weight": 140,
-      "destination": "嘉定",
-      "status": "待分配",
-      "notes": "待排班"
-    }
-  ],
-  "metricLabels": [
-    "订单数",
-    "已分配",
-    "总重量"
-  ]
-} as const;
-
-const fields = project.fields as unknown as Field[];
-const statuses: string[] = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
+interface DragData {
+  kind: "pool-order" | "stop";
+  orderId: string;
+  driverId?: string;
 }
 
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
+interface PendingMove {
+  orderId: string;
+  fromDriverId: string;
+  toDriverId: string | null; // null 表示退回待分配
+  insertIndex: number;
 }
 
-function saveRecords(records: RecordItem[]) {
-  localStorage.setItem(project.storageKey, JSON.stringify(records));
-}
+function Board() {
+  const { message } = AntApp.useApp();
+  const orders = useScheduleStore((state) => state.orders);
+  const drivers = useScheduleStore((state) => state.drivers);
+  const plans = useScheduleStore((state) => state.plans);
+  const versions = useScheduleStore((state) => state.versions);
+  const tryAssign = useScheduleStore((state) => state.tryAssign);
+  const reschedule = useScheduleStore((state) => state.reschedule);
+  const unassign = useScheduleStore((state) => state.unassign);
 
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
+  const [pendingMove, setPendingMove] = useState<PendingMove | null>(null);
 
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
-}
-
-export default function App() {
-  const [records, setRecords] = useState<RecordItem[]>(loadRecords);
-  const [form, setForm] = useState<Record<string, string | number>>(createBlank);
-  const [note, setNote] = useState("");
-  const [filter, setFilter] = useState<string>(project.filters[0]);
-
-  const filteredRecords = useMemo(() => {
-    if (filter.startsWith("全部")) return records;
-    return records.filter((record) => Object.values(record).includes(filter));
-  }, [filter, records]);
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
   const metrics = useMemo(() => {
-    const total = records.length;
-    const second = records.filter((record) => record.status === statuses[1]).length;
-    const third = records.filter((record) => record.status === statuses[2]).length;
-    const numberValues = records.flatMap((record) =>
-      fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-    );
-    const sum = numberValues.reduce((acc, value) => acc + value, 0);
-    return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-  }, [records]);
+    let assigned = 0;
+    let delivered = 0;
+    for (const order of orders) {
+      const status = orderStatusOf(order.id, plans);
+      if (status === "assigned") assigned += 1;
+      if (status === "delivered") delivered += 1;
+    }
+    return {
+      pending: orders.length - assigned - delivered,
+      assigned,
+      delivered,
+      versions: versions.length,
+    };
+  }, [orders, plans, versions]);
 
-  const chartRows = statuses.map((status) => ({
-    status,
-    value: records.filter((record) => record.status === status).length
-  }));
-  const maxChart = Math.max(1, ...chartRows.map((row) => row.value));
-
-  function updateRecords(next: RecordItem[]) {
-    setRecords(next);
-    saveRecords(next);
+  /** 解析放置目标：泳道（追加）、停靠卡（插到其前）、待分配池 */
+  function resolveTarget(overId: string): { driverId: string | null; insertIndex: number } | null {
+    if (overId === "pool") return { driverId: null, insertIndex: 0 };
+    if (overId.startsWith("lane:")) {
+      const driverId = overId.slice(5);
+      return { driverId, insertIndex: (plans[driverId] ?? []).length };
+    }
+    if (overId.startsWith("before:")) {
+      const targetOrderId = overId.slice(7);
+      for (const [driverId, stops] of Object.entries(plans)) {
+        const index = stops.findIndex((stop) => stop.orderId === targetOrderId);
+        if (index >= 0) return { driverId, insertIndex: index };
+      }
+    }
+    return null;
   }
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const next: RecordItem = {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem;
-    updateRecords([next, ...records]);
-    setForm(createBlank());
-    setNote("");
+  function handleDragEnd(event: DragEndEvent) {
+    const data = event.active.data.current as DragData | undefined;
+    const over = event.over;
+    if (!data || !over) return;
+    const target = resolveTarget(String(over.id));
+    if (!target) return;
+
+    if (data.kind === "pool-order") {
+      if (!target.driverId) return; // 池内拖动，忽略
+      const ok = tryAssign(data.orderId, target.driverId, target.insertIndex);
+      if (ok) {
+        message.success("已按顺序重算到达时间，承诺生效");
+      } else {
+        message.error("超时或累计超载，整单拒绝，详见冲突列表");
+      }
+      return;
+    }
+
+    // 已排班订单的拖动属于调班：需要原因并生成新版本
+    const fromDriverId = data.driverId;
+    if (!fromDriverId) return;
+    if (target.driverId === fromDriverId) {
+      const stops = plans[fromDriverId] ?? [];
+      const oldIndex = stops.findIndex((stop) => stop.orderId === data.orderId);
+      if (oldIndex === target.insertIndex || oldIndex === target.insertIndex - 1) return; // 位置未变
+    }
+    if (target.driverId === null && data.kind === "stop") {
+      setPendingMove({ orderId: data.orderId, fromDriverId, toDriverId: null, insertIndex: 0 });
+      return;
+    }
+    if (!target.driverId) return;
+    setPendingMove({
+      orderId: data.orderId,
+      fromDriverId,
+      toDriverId: target.driverId,
+      insertIndex: target.insertIndex,
+    });
+  }
+
+  function confirmMove(reason: string) {
+    if (!pendingMove) return;
+    if (pendingMove.toDriverId === null) {
+      unassign(pendingMove.orderId, pendingMove.fromDriverId, reason);
+      message.success("已退回待分配，并生成新派单版本");
+    } else {
+      const ok = reschedule({ ...pendingMove, toDriverId: pendingMove.toDriverId, reason });
+      if (ok) {
+        message.success("调班成功，已生成新派单版本，原派单保留");
+      } else {
+        message.error("调班后超时或累计超载，整单拒绝，详见冲突列表");
+      }
+    }
+    setPendingMove(null);
   }
 
   return (
@@ -184,106 +138,69 @@ export default function App() {
       <div className="shell">
         <header className="topbar">
           <div>
-            <p className="eyebrow">{project.industry}行业前端最小闭环</p>
-            <h1>{project.title}</h1>
-            <p className="subtitle">{project.subtitle}</p>
+            <p className="eyebrow">物流 · 司机运力承诺台</p>
+            <h1>配送任务拖拽排班</h1>
+            <p className="subtitle">
+              订单登记商圈、装卸分钟、重量与可送达时段；司机维护班次与载重。拖入即按顺序重算承诺到达时间，
+              超时或累计超载整单拒绝；连续作业满 4 小时自动插入休息，休息不覆盖已锁定任务。
+            </p>
           </div>
-          <div className="stack">{project.stack.map((item) => <span className="tag" key={item}>{item}</span>)}</div>
         </header>
 
         <section className="metrics">
-          {project.metricLabels.map((label, index) => (
-            <article className="metric" key={label}>
-              <span>{label}</span>
-              <strong>{metrics[index]}</strong>
-            </article>
-          ))}
+          <article className="metric">
+            <span>待分配订单</span>
+            <strong>{metrics.pending}</strong>
+          </article>
+          <article className="metric">
+            <span>承诺中</span>
+            <strong>{metrics.assigned}</strong>
+          </article>
+          <article className="metric">
+            <span>已锁定（已配送）</span>
+            <strong>{metrics.delivered}</strong>
+          </article>
+          <article className="metric">
+            <span>派单版本</span>
+            <strong>{metrics.versions}</strong>
+          </article>
         </section>
 
-        <section className="workspace">
-          <form className="panel" onSubmit={handleSubmit}>
-            <h2>{project.formTitle}</h2>
-            <div className="form-grid">
-              {fields.map((field) => (
-                <label key={field.key}>
-                  {field.label}
-                  {field.type === "select" ? (
-                    <select
-                      value={String(form[field.key])}
-                      onChange={(event) => setForm({ ...form, [field.key]: event.target.value })}
-                      required
-                    >
-                      <option value="">请选择</option>
-                      {field.options?.map((option) => <option key={option}>{option}</option>)}
-                    </select>
-                  ) : (
-                    <input
-                      type={field.type || "text"}
-                      value={form[field.key]}
-                      onChange={(event) =>
-                        setForm({ ...form, [field.key]: field.type === "number" ? Number(event.target.value) : event.target.value })
-                      }
-                      required
-                    />
-                  )}
-                </label>
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+          <div className="board">
+            <aside className="side">
+              <OrderForm />
+              <DriverForm />
+              <OrderPool />
+            </aside>
+            <section className="lanes">
+              {drivers.map((driver) => (
+                <DriverLane key={driver.id} driver={driver} orders={orders} />
               ))}
-              <label>
-                备注
-                <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="填写处理说明或现场备注" />
-              </label>
-              <button type="submit">{project.primaryAction}</button>
-            </div>
-          </form>
+            </section>
+          </div>
+        </DndContext>
 
-          <section className="list-panel">
-            <div className="toolbar">
-              <h2>{project.entityLabel}列表</h2>
-              <select value={filter} onChange={(event) => setFilter(event.target.value)}>
-                {project.filters.map((item) => <option key={item}>{item}</option>)}
-              </select>
-            </div>
+        <div className="bottom-panels">
+          <ConflictPanel />
+          <VersionPanel />
+        </div>
 
-            <div className="record-grid">
-              {filteredRecords.length === 0 ? <div className="empty">暂无匹配数据</div> : filteredRecords.map((record) => (
-                <article className="record" key={record.id}>
-                  <div className="record-head">
-                    <p className="record-title">{primaryText(record)}</p>
-                    <span className="status">{record.status}</span>
-                  </div>
-                  <div className="details">
-                    {fields.map((field) => (
-                      <span key={field.key}>{field.label}: {record[field.key]}</span>
-                    ))}
-                  </div>
-                  <p className="note">{record.notes}</p>
-                  <div className="actions">
-                    <button type="button" onClick={() => updateRecords(records.map((item) => item.id === record.id ? { ...item, status: nextStatus(item.status) } : item))}>
-                      流转状态
-                    </button>
-                    <button className="secondary" type="button" onClick={() => navigator.clipboard?.writeText(primaryText(record))}>
-                      复制摘要
-                    </button>
-                    <button className="danger" type="button" onClick={() => updateRecords(records.filter((item) => item.id !== record.id))}>
-                      删除
-                    </button>
-                  </div>
-                </article>
-              ))}
-            </div>
-
-            <div className="mini-chart">
-              {chartRows.map((row) => (
-                <div className="bar" key={row.status}>
-                  <span>{row.status}</span>
-                  <div className="bar-track"><div className="bar-fill" style={{ width: `${(row.value / maxChart) * 100}%` }} /></div>
-                  <strong>{row.value}</strong>
-                </div>
-              ))}
-            </div>
-          </section>
-        </section>
+        <ReasonModal
+          open={pendingMove !== null}
+          title={pendingMove?.toDriverId === null ? "退回待分配" : "调班确认"}
+          onConfirm={confirmMove}
+          onCancel={() => setPendingMove(null)}
+        />
       </div>
     </main>
+  );
+}
+
+export default function App() {
+  return (
+    <AntApp>
+      <Board />
+    </AntApp>
   );
 }
